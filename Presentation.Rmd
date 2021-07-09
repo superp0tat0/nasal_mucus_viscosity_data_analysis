@@ -1,0 +1,282 @@
+---
+title: "Bayer Take Home Project Presentation"
+author: "Siyi Wei"
+date: "05/07/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(dplyr)
+library(corrplot)
+library(ggplot2)
+library(ggrepel)
+library(reshape2)
+library(caret)
+library(gridExtra)
+```
+
+```{r, helper_function}
+
+to_factor <- function(dataset_in){
+  for(col in colnames(dataset_in)){
+    if(typeof(dataset_in[,col]) == "character"){
+      dataset_in[,col] <- as.factor(dataset_in[,col])
+    }
+  }
+  return(dataset_in)
+}
+
+auto_pie <- function(col_name){
+  var_names <- c(col_name, "arm")
+  new_data <- discrete_data %>% 
+    group_by(across(all_of(var_names))) %>% 
+    dplyr::summarize(count = n())
+  colnames(new_data)[1] <- "category"
+  
+  new_data <- new_data %>%
+    group_by(arm) %>%
+    mutate(countT = sum(count)) %>%
+    group_by(category, .add=TRUE) %>%
+    mutate(perc = round(100*count/countT,2)) %>%
+    mutate(pos = cumsum(perc)- perc/2)
+  
+  chart <- ggplot(new_data, aes(x = "", y = perc, fill = category)) +
+    geom_bar(width = 1, stat = "identity") +
+    coord_polar("y", start = 0) + 
+    labs(x = "",  y = "", title = col_name) + 
+    theme(axis.text=element_text(size=12),
+        axis.title=element_text(size=14,face="bold"),
+        title = element_text(size=14,face="bold")) +
+    facet_wrap(~arm)
+  
+  return(chart)
+}
+
+efficacy <- read.csv("./efficacy.csv")
+randomization <- read.csv("./randomization.csv")
+subject <- read.csv("./subject.csv")
+
+raw_data <- efficacy %>%
+  left_join(randomization, by = "subject") %>%
+  left_join(subject, by = "subject")
+
+rm(efficacy, randomization, subject)
+raw_data = to_factor(raw_data)
+```
+## Data Description
+
+In this dataset, we have 444 observations with totally 9 variables. Where 4 of them are categorical and 5 of them are numerical. Our controlled variable is the assigned treatment (arm), which is a non balanced binary variable with 221 PLACEBOs and 223 ACTIVEs. More details could be viewed below:
+
+|   | subject  | nosebleeds   | duration  | arm  |
+|---|---|---|---|---|
+| Categorical  | -  | -  |  - |Binary   | 
+| Numerical  |  Discrete |  Discrete |  Discrete |  - |
+
+|   |  country | eye.colour  | tissue.use  | previous.year  |mucus.viscosity |
+|---|---|---|---|---|---|---|---|---|---|
+| Categorical |  Multivariate |Multivariate   |  Binary | -  | -  |
+| Numerical  | -  |  - | -  |  Discrete |  Continuous |
+
+## Feature Engineering
+
+### Data Aggregation
+
+There are three datasets provided for this analysis. Efficacy, Randomization and Subject.
+
+|   | Efficacy  | Randomization  | Subject   |
+|---|---|---|---|
+| Observations  | 444  |444   | 444  |
+| Features  | 3  |  2 | 6  |
+|UID | subject | subject| subject |
+| Feature Name  | nosebleeds, durantion  |  arm | country, eye.colour, tissue.use, previous.year, mucus.viscosity  |
+
+All of them have a unique identifier "subject". Which does not contain any duplicates. Our first step is to aggregate three tables based on this unique identifier "subject".
+
+### Impute the NULL values
+
+We found there are multiple NA entries in eye.colour. Since there is no information on why those entries are missing. Based on simple inference, geographical position and race are the key factors that relate to eye colours. Therefore we decide to impute the NA values in eye.colour based on the most common eye.colour in the same country. However, country "G" only has one eye colour and the entry is missing. So we set it to "BLACK" randomly.
+
+There is also one patient that has a NA value for mucus.viscosity. We will use the mean of mucus.viscosity based on other patients in the same tissue.use level.
+
+```{r, FE}
+#impute the NA value by country
+frequence <- raw_data %>% group_by(country, eye.colour) %>% tally()
+
+raw_data$eye.colour[raw_data$country == "A" & is.na(raw_data$eye.colour)] = "BLUE"
+raw_data$eye.colour[raw_data$country == "D" & is.na(raw_data$eye.colour)] = "BLUE"
+raw_data$eye.colour[raw_data$country == "E" & is.na(raw_data$eye.colour)] = "BLUE"
+raw_data$eye.colour[raw_data$country == "F" & is.na(raw_data$eye.colour)] = "BLUE"
+raw_data$eye.colour[raw_data$country == "I" & is.na(raw_data$eye.colour)] = "BROWN"
+raw_data$eye.colour[raw_data$country == "J" & is.na(raw_data$eye.colour)] = "BROWN"
+raw_data$eye.colour[raw_data$country == "E" & is.na(raw_data$eye.colour)] = "BLUE"
+raw_data$eye.colour[raw_data$country == "G" & is.na(raw_data$eye.colour)] = "BLACK"
+
+index = which(is.na(raw_data$mucus.viscosity))
+raw_data$mucus.viscosity[index] = mean(raw_data$mucus.viscosity[raw_data$tissue.use == raw_data$tissue.use[index]], na.rm = T)
+```
+
+### Change the unit of nosebleeds to times/year
+
+We could see for different patients, the time that the subject was on the study (duration) are different. This also affects the number of nosebleeds observed in study (nosebleeds). To construct a better metric which could measure the treatment effect. We decide to transform nosebleeds unit to times/year by dividing the current duration and times 365 days. Then round the new nosebleeds value to its nearest integers.
+
+```{r}
+raw_data$nosebleeds = as.integer(round(raw_data$nosebleeds/raw_data$duration * 365))
+```
+
+
+### Construct measure of treatment effect
+
+This new treatment (superdupripine) was produced for the unmet clinical need of recurrent serious nosebleeds. Therefore, the best measure for the treatment effect would be the times of nosebleeds reduced from last year.
+
+```{r}
+raw_data$effect = raw_data$nosebleeds - raw_data$previous.year
+
+discrete_data = raw_data[,c(4,5,6,7)]
+continuous_data = raw_data[,-c(1,4,5,6,7)]
+```
+
+
+## Exploratory Data Analysis
+
+### Data Statistics
+The Summary of Statistics could be viewed below:
+
+```{r}
+summary(raw_data[,-1])
+```
+
+### Scaled Numerical Data Distribution
+From the numerical distribution plot. We could see there are huge amounts of outliers inside of our dataset. We will address their details below
+
+* nosebleeds & previous year & mucus.viscosity: Since there are some specific patients who have more serious nosebleeds than the others. We need to investigate more on those valuable outliers.
+* duration: As we have explained, the duration of the patients in study varies a lot. But most of the durations are close to one year. So we have corrected all the patients' duration and its related features (nosebleeds) to one year.
+* effect: The effect of the treatments heavily depends on the patient's nosebleeds level in the past year. From the plot we could see that patients' conditions are worse (positive outliers) or better (negative outliers). We also need to investigate those outliers.
+
+```{r}
+continuous_data = melt(scale(continuous_data))
+
+ggplot(continuous_data, aes(x = Var2, y = value, fill = Var2)) + geom_boxplot()
+```
+
+
+### Categorical Data Visualization
+
+From the categorical data visulization, we could confirm the balance between placebo group and active group on country, eye.colour and tissue.use. There should not be any sigficant fairness problems caused by groupwise differences.
+
+```{r}
+auto_pie("country")
+auto_pie("eye.colour")
+auto_pie("tissue.use")
+```
+
+## Data Values
+
+### How might you show how the treatment effect depends on nasal mucus viscosity? What about the effect of paper tissues?
+
+To demonstrate the treatment effect indeed depends on nasal mucus viscosity. We need to refer to the continuous distribution plot we had in EDA. Since we already know there are outliers for both positive and negative sides. **We want to know for the positive side outliers with active treatment effects, where patients have more nosebleeds than last year. What are those patients' nasal mucus viscosity distributions? Then we could compare them with the negative outliers with the same condition**
+
+From the graph below. We could see the active treatment group. Even though the peak of mucus viscosity for the negative/none effect group and the positive effect group are close. Positive effect group has a heavier right tail whereas the negative/none effect has no right tails at all. **This indicates the treatment could be more effective on patients that have nasal mucus viscosity higher than usual (>= 2.5).**
+
+```{r}
+negative <- raw_data %>%
+  filter(arm == "ACTIVE", effect >= 0) %>%
+  select(mucus.viscosity) %>%
+  mutate(type = "negative_none_effect")
+
+positive <- raw_data %>%
+  filter(arm == "ACTIVE", effect <= -1) %>%
+  select(mucus.viscosity) %>%
+  mutate(type = "positive_effect")
+
+data_merge = melt(rbind(negative, positive))
+
+ggplot(data_merge, aes(x = value, fill = type)) + geom_density(alpha = 0.5)
+```
+Similarly, to demonstrate the treatment effect depends on the paper tissues. We will compare the proportion of patients who have positive effects and negative effects based on tissue use among active treatment groups.
+**From the graph below, we cannot see a clear indication of the relationship between the use of tissues and treatment effect.**
+
+
+```{r}
+negative <- raw_data %>%
+  filter(arm == "ACTIVE", effect >= 0) %>%
+  select(tissue.use) %>%
+  mutate(type = "negative_none_effect")
+
+positive <- raw_data %>%
+  filter(arm == "ACTIVE", effect <= -1) %>%
+  select(tissue.use) %>%
+  mutate(type = "positive_effect")
+
+data_merge = melt(rbind(negative, positive))
+
+data_merge <- data_merge %>%
+  group_by(tissue.use, type) %>%
+  summarize(n = n())
+
+data_merge <- data_merge %>% 
+  group_by(tissue.use) %>%
+  mutate(countT = sum(n)) %>%
+  mutate(perc = round(100*n/countT,2))
+  
+
+ggplot(data_merge, aes(x = "", y = perc, fill = type)) +
+    geom_bar(width = 1, stat = "identity") +
+    coord_polar("y", start = 0) + 
+    labs(x = "",  y = "", title = "Tissue Use for Active Treatment Patients") + 
+    theme(axis.text=element_text(size=12),
+        axis.title=element_text(size=14,face="bold"),
+        title = element_text(size=14,face="bold")) +
+    facet_wrap(~tissue.use)
+```
+
+
+**However, we could confirm that the most medically serious cases are those patients who buys a large amount of paper tissues by visualizing the relationships between nosebleeds and nosebleeds last year with tissue.use**
+
+
+```{r}
+p1 <- ggplot(raw_data, aes(x = nosebleeds, fill = tissue.use)) + geom_density(alpha = 0.5)
+p2 <- ggplot(raw_data, aes(x = previous.year, fill = tissue.use)) + geom_density(alpha = 0.5)
+grid.arrange(p1, p2, nrow = 1)
+```
+
+
+### Hospitalization for nosebleed may depend on local medical practice. Does this have any impact? How can you understand this?
+
+Intuitively whether nosebleeds require hospitalization heavily depends on local medical practices. For example, in humid area, serious nosebleeds could be extremely rare which requires hospitalization. However, in dry areas, the nosebleeds at the same level may not be considered hospitalization at all. Both of the decisions are made relies on local medical practice. And there could be much more factors than the humid level.
+Those biases will definitely have some impact on how we measure the performance of the treatments. For example, the patients who live in dry areas tend to have more nosebleeds than the patients who live in humid areas.
+
+### How might you predict the rate of nosebleed from the data that you have? What might a statistical model for this look like?
+
+There could be multiple ways we could predict the rate of nosebleeds. From the simplest model, we could use Linear Regression or Non-Linear Regression to some complex model like Regression tree.
+
+However, due to the small amount of the observations. I would prefer to use simple models. However, based on the summary below we could see the simple linear regression model perform poorly on our dataset. If we diagnose the data, we could see most of the variables are not statistically significant. This is most likely because of our categorical features.
+
+```{r}
+index = sample(c(1:444), nrow(raw_data)*0.2)
+train_set = raw_data[-index,]
+test_set = raw_data[index,]
+model <- lm(nosebleeds ~ . - effect - subject - duration, train_set)
+pred <- round(predict(model, type = "response", newdata = test_set))
+caret::confusionMatrix(as.factor(pred), as.factor(test_set$nosebleeds))
+
+summary(model)
+```
+
+Instead, we could use a groupwise linear regression. **We first assign the samples into their subgroups based on categorical variables. Then using a regression model to make prediction of nosebleeds rate based on values of continuous variables only in the subgroups.** This could reduce the interaction effect between irrelevant features to minimum. For some of the NA coefficients in the following table, this is because the corresponding variable has the same value for all subgroup samples. Which could be resolved by increasing the sample size to include more various samples.
+
+```{r}
+library(data.table)
+df1 <- data.table(raw_data)
+
+coeff <- df1[,as.list(coef(lm(nosebleeds ~ previous.year + mucus.viscosity))), by=c("arm", "country", "eye.colour", "tissue.use")]
+
+coeff[c(35:40),]
+```
+
+
+### How can you use such a statistical model to simulate a Phase III trial? What inputs would it need, how would you generate them, and what outputs would it have?
+
+To use this statistical model to simulate a Phase III trial. We need to generate the inputs first. The inputs we need would be the treatment groups, country, eye colour, tissues, nosebleeds in the last year and the mucus viscosity. For categorical variables, we could simply generate them using combinations. Then for the continuous data like mucus viscosity and nosebleeds in the previous year. We want to generate them from a normal distribution with mean and standard error to be the existing mean and standard error of the data subgroups (grouped by categorical variables).
+
+For the outputs, we will get the predicted nosebleeds with unit times/year. Then with the predictive model and the generated data, we could simulate a Phase III trial and visualize the treatment effect. However, this method will have lots of disadvantages. It will reinforce the patterns of the observed data (overfit), where a real Phase III trial could bring more observations and include patterns we did not yet observe.
